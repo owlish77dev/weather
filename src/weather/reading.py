@@ -35,7 +35,7 @@ def read_snow_data_definition():
 class IWeatherReader(ABC):
 
     @abstractmethod
-    def read_all_data(self, files: Sequence[Path] | list[Path] | Path):
+    def read_all_data(self):
         pass
 
 
@@ -43,12 +43,15 @@ class FzdDataReader(IWeatherReader):
 
     def __init__(self, files: Sequence[Path] | list[Path] | Path):
         super().__init__()
+        self._data = {}
         if isinstance(files, Path) and files.is_dir():
             self._files = []
             for dir_p, dir_name, files in files.walk():
                 bag_files = [dir_p.joinpath(f) for f in files if dir_p.joinpath(f).suffix == ".bag"]
-                bag_files = [bag_files[0]]  # can be commented out if you have time
+                # bag_files = [bag_files[0]]  # can be commented out if you have time
                 self._files.extend(bag_files)
+        elif isinstance(files, Path) and files.is_file():
+            self._files = [files]
         else:
             self._files = files
 
@@ -99,8 +102,6 @@ class FzdDataReader(IWeatherReader):
         """Read the static position and rotations of the three lidar sensors and mapScala."""
         topic = "/tf_static"
         tf = []
-        if len(self._files) == 0:
-            return pd.DataFrame()
         with AnyReader(self._files) as ar:
             conn = [c for c in ar.connections if c.topic == topic]
             for c, ts, raw_data in ar.messages(conn):
@@ -138,12 +139,13 @@ class FzdDataReader(IWeatherReader):
         i = 0
         for c, ts, raw_data in ar.messages(connections=pcl_conn):
             msg = ar.deserialize(raw_data, c.msgtype)
-            if i == 0:
-                for field in msg.fields:
-                    print(
-                        field.name, field.offset, field.datatype, field.count
-                    )
-                i += 1
+            n_fields = len(msg.fields)
+            # if i == 0:
+            #     for field in msg.fields:
+            #         print(
+            #             field.name, field.offset, field.datatype, field.count
+            #         )
+            #     i += 1
             enc = "big" if msg.is_bigendian else "little"
             nof_pts = msg.width
             d = msg.data
@@ -159,7 +161,7 @@ class FzdDataReader(IWeatherReader):
                 points["intensity"].append(np.nan)
             else:
                 lidar_points = FzdDataReader.decode_lidar_pointcloud(
-                    data=d, big_end=msg.is_bigendian)
+                    data=d, big_end=msg.is_bigendian, n_fields=n_fields)
                 points["x"].extend(lidar_points[:, 0])
                 points["y"].extend(lidar_points[:, 1])
                 points["z"].extend(lidar_points[:, 2])
@@ -172,6 +174,7 @@ class FzdDataReader(IWeatherReader):
         pcl_df = pd.DataFrame(data=points)
         pcl_df.set_index(keys=["ts", "id"], inplace=True)
         return pcl_df
+    # BF lidar has additional field 'return_id' of type uint32
 
     @staticmethod
     def read_marker_array(ar: AnyReader, connections: Collection[Connection]):
@@ -219,11 +222,11 @@ class FzdDataReader(IWeatherReader):
         yield pcl_df, obj_df
 
     @staticmethod
-    def decode_lidar_pointcloud(data: np.ndarray, big_end: bool) -> np.ndarray:
+    def decode_lidar_pointcloud(data: np.ndarray, big_end: bool, n_fields: int) -> np.ndarray:
         endian = ">" if big_end else "<"
         dt = np.dtype(endian + "f4")
         out_data = np.frombuffer(data, dtype=dt)
-        points = out_data.reshape(-1, 4)
+        points = out_data.reshape(-1, n_fields)
         return points
 
     def _read_weather(self):
@@ -258,25 +261,70 @@ class FzdDataReader(IWeatherReader):
 
 
     def read_all_data(self):
-        # for dir_p, dir_name, files in snow_path.walk():
-        #     bag_files = [dir_p.joinpath(f) for f in files if dir_p.joinpath(f).suffix == ".bag"]
-        #     bag_files = [bag_files[0]]  # can be commented out if you have time
+        """Read all data from sensors."""
         radar_gen = self._read_radar()
-        transform_df = self._read_transformations()
-        print(f"n_rows: {transform_df.shape[0]}")
+        # loops will just be processed once
+        for det_df, obj_df in radar_gen:
+            self._data["det_radar"] = det_df
+            self._data["obj_radar"] = obj_df
+        self._data["transformation"] = self._read_transformations()
         weather_gen = self._read_weather()
+        for weather_df in weather_gen:
+            self._data["weather"] = weather_df
         lidar_gen = self._read_delphi_lidar()
         bf_lidar = self._read_bf_lidar()
-        # for det_df in bf_lidar:
-        #     print(f"Length of detection df: {det_df.shape[0]}")
         for pcl_df, obj_df in lidar_gen:
-            print(f"Length of pcl_df: {pcl_df.shape[0]}")
-            print(f"Length of obj_df : {obj_df.shape[0]}")
-        #     det_ts = det_df.index.unique(level=0).values
-        #     obj_ts = obj_df.index.unique(level=0).values
-        #     print(f"Timestamps are equal: {set(det_ts) == set(obj_ts)}")  # False
-        #     print(f"Timestamps are disjoint: {set(det_ts).isdisjoint(set(obj_ts))}")  # True
+            self._data["pcl_delphi_lidar"] = pcl_df
+            self._data["obj_delphi_lidar"] = obj_df
+        for pcl_df in bf_lidar:
+            self._data["pcl_bf_lidar"] = pcl_df
         pass
+
+    @property
+    def weather(self) -> pd.DataFrame:
+        if "weather" in self._data.keys():
+            return self._data["weather"]
+        else:
+            return pd.DataFrame()
+
+    @property
+    def transformation(self) -> pd.DataFrame:
+        return self._data["transformation"]
+
+    @property
+    def radar_detections(self) -> pd.DataFrame:
+        if "det_radar" in self._data.keys():
+            return self._data["det_radar"]
+        else:
+            return pd.DataFrame()
+
+    @property
+    def radar_objects(self) -> pd.DataFrame:
+        if "obj_radar" in self._data.keys():
+            return self._data["obj_radar"]
+        else:
+            return pd.DataFrame()
+
+    @property
+    def point_cloud_bf_lidar(self) -> pd.DataFrame:
+        if "pcl_bf_lidar" in self._data.keys():
+            return self._data["pcl_bf_lidar"]
+        else:
+            return pd.DataFrame()
+
+    @property
+    def point_cloud_delphi_lidar(self) -> pd.DataFrame:
+        if "pcl_delphi_lidar" in self._data.keys():
+            return self._data["pcl_delphi_lidar"]
+        else:
+            return pd.DataFrame()
+
+    @property
+    def objects_delphi_lidar(self) -> pd.DataFrame:
+        if "obj_delphi_lidar" in self._data.keys():
+            return self._data["obj_delphi_lidar"]
+        else:
+            return pd.DataFrame()
 
 
 if __name__ == "__main__":
